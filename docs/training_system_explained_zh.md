@@ -51,7 +51,26 @@
 
 说明并行、AMP、状态保存恢复都交给 Accelerate/DeepSpeed 管理。
 
----
+
+### 1.4 `cfg.model` 是在哪里设置的？具体是什么值？
+
+这个问题的关键是 Hydra 的配置合成顺序：
+
+1. `scripts/train.py` 用 `@hydra.main(config_path="../configs", config_name="train")` 指定基础配置入口是 `configs/train.yaml`。
+2. `configs/train.yaml` 里把 `model` 默认设成 `null`（`defaults` 中是 `- model: null`），所以仅靠基础配置时 `cfg.model` 还没有具体模型结构。
+3. 真正训练时通过命令行传 `task=...`（例如 `task=libero_uncond_2cam224_1e-4`），Hydra 会加载 `configs/task/*.yaml`。
+4. task 配置里用 `override /model: fastwam`（或 `fastwam_joint` / `fastwam_idm`）把模型组覆盖掉。
+5. 对应模型组文件在 `configs/model/*.yaml`，其中包含 `_target_`（比如 `fastwam.runtime.create_fastwam`）以及完整的模型参数；最终这整棵配置树就是 `cfg.model`。
+
+所以：
+
+- 当你跑 `task=libero_uncond_2cam224_1e-4` 时，`cfg.model` 来自 `configs/model/fastwam.yaml`。
+- 当你跑 `task=libero_joint_2cam224_1e-4` 时，`cfg.model` 来自 `configs/model/fastwam_joint.yaml`。
+- 当你跑 `task=libero_idm_2cam224_1e-4` 时，`cfg.model` 来自 `configs/model/fastwam_idm.yaml`。
+
+最后在 `run_training` 中，代码用 `instantiate(cfg.model, model_dtype=model_dtype, device=model_device)` 实例化该模型配置。
+
+
 
 ## 2. Precision（混合精度）配置如何生效
 
