@@ -70,7 +70,7 @@
 
 最后在 `run_training` 中，代码用 `instantiate(cfg.model, model_dtype=model_dtype, device=model_device)` 实例化该模型配置。
 
----
+
 
 ## 2. Precision（混合精度）配置如何生效
 
