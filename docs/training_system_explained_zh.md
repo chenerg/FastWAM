@@ -264,6 +264,7 @@ with self.accelerator.autocast():
 4. loss 前把预测与目标升到 fp32（`.float()`）算 MSE。
 5. 反向传播仍由 Accelerate AMP/DeepSpeed 管理缩放与同步。
 
+
 ## 4. Dataset 处理与载入全链路
 
 ## 4.1 数据配置层（Hydra）
