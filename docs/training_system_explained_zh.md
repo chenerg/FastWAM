@@ -70,6 +70,7 @@
 
 最后在 `run_training` 中，代码用 `instantiate(cfg.model, model_dtype=model_dtype, device=model_device)` 实例化该模型配置。
 
+---
 
 ## 2. Precision（混合精度）配置如何生效
 
@@ -124,6 +125,66 @@ with self.accelerator.autocast():
 可理解为：**主导开关在训练 config (`mixed_precision`) + Accelerate**。
 
 ---
+
+## 2.5 为什么 `mixed_precision: "bf16"` 不直接写在 `ds_zero*_config.json`？
+
+这是这个仓库有意做的“单一真源（single source of truth）”设计：
+
+1. **统一入口在 Hydra 训练配置**  
+   `configs/train.yaml` 的 `mixed_precision` 会同时驱动：
+   - `runtime.py` 里 `model_dtype` 的选择（影响模型权重与输入 cast）
+   - `Wan22Trainer` 里 `Accelerator(mixed_precision=...)`（影响 autocast/AMP 行为）
+
+2. **DeepSpeed JSON 主要负责 ZeRO/通信/分桶**  
+   本项目的 `ds_zero1_config.json` / `ds_zero2_config.json` 只放 ZeRO stage、bucket 等并行策略，
+   不再重复放 fp16/bf16 开关，避免和 Hydra 里的 precision 配置出现双写冲突。
+
+3. **accelerate 配置文件里已明确这个约定**  
+   `accelerate_zero1_ds.yaml` / `accelerate_zero2_ds.yaml` 都把 `mixed_precision: null`，并注释：
+   precision 由训练配置（`Accelerator(mixed_precision=...)`）和 DS JSON 共同控制。当前仓库实践是把主开关放在训练配置侧。
+
+4. **这样做的直接收益**
+   - 切换精度只改一处：`configs/train.yaml`（或命令行 override，如 `mixed_precision=fp16`）。
+   - 同一份 task 配置在 zero1/zero2 启动脚本下行为一致，不会因为 DS JSON 不同而出现“模型 dtype 与 AMP dtype 不一致”。
+
+> 简单说：不是“不能放 DS JSON”，而是本仓库选择把精度主开关放在 Hydra/Accelerate 这一层，
+> 让 `model_dtype` 与 `autocast` 始终由同一个配置字段驱动，减少配置分叉风险。
+
+## 2.6 如果“只在 `ds_zero*_config.json` 里指定 bf16”，会有什么区别？（训练效果 + 显存）
+
+这个问题分两种情况看：
+
+### 情况 A：`cfg.mixed_precision` 也正好是 `bf16`
+
+- **训练行为**：通常差异很小（很多时候几乎等价）。
+- **显存占用**：通常也接近，因为模型本身仍按 bf16 路径构建与训练。
+
+也就是说，当 Hydra/Accelerate 和 DS JSON 都一致指向 bf16 时，基本不会出现明显差别。
+
+### 情况 B：只改 DS JSON 为 bf16，但 `cfg.mixed_precision` 不是 bf16（例如 `no`）
+
+这时容易出现“配置分叉”，差异就会比较明显：
+
+1. **网络训练侧（数值/稳定性/可复现）**
+   - 代码里 `cfg.mixed_precision` 会先决定 `model_dtype`，并用于模型实例化。
+   - 同时 trainer 里 `Accelerator(mixed_precision=cfg.mixed_precision)` 又按这个值控制 autocast。
+   - 如果 DS JSON 与这条主链不一致，就会出现额外 cast、路径不一致，训练行为更难预期与复现。
+
+2. **显存占用侧**
+   - 若 `cfg.mixed_precision=no`，模型参数可能先以 fp32 构建；即使 DS 侧想走 bf16，
+     参数/优化器状态与激活的实际占用不一定达到“纯 bf16 路径”那么省。
+   - 结果通常是：**显存优化效果不如统一从 `cfg.mixed_precision=bf16` 走全链路来得稳定**。
+
+### 实践建议（本仓库）
+
+- 想要 bf16，优先改 `configs/train.yaml`（或 CLI `mixed_precision=bf16`），保证：
+  - `model_dtype`（模型参数/输入 cast）
+  - `Accelerator` autocast
+  - DS 运行时
+  三者方向一致。
+
+> 一句话：只改 DS JSON 在“恰好不冲突”时可能看不出差别；
+> 但一旦和 Hydra/Accelerate 主链不一致，训练行为和显存表现都会更不稳定。
 
 ## 3. 网络内部 dtype 流转（从数据到 loss）
 
