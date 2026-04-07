@@ -70,7 +70,6 @@
 
 最后在 `run_training` 中，代码用 `instantiate(cfg.model, model_dtype=model_dtype, device=model_device)` 实例化该模型配置。
 
----
 
 ## 2. Precision（混合精度）配置如何生效
 
@@ -203,6 +202,7 @@ with self.accelerator.autocast():
 3. DiT/MoT/VAE 主干在 `self.torch_dtype` + `accelerator.autocast()` 下计算。
 4. loss 前把预测与目标升到 fp32（`.float()`）算 MSE。
 5. 反向传播仍由 Accelerate AMP/DeepSpeed 管理缩放与同步。
+
 
 ## 4. Dataset 处理与载入全链路
 
