@@ -51,7 +51,25 @@
 
 说明并行、AMP、状态保存恢复都交给 Accelerate/DeepSpeed 管理。
 
----
+
+### 1.4 `cfg.model` 是在哪里设置的？具体是什么值？
+
+这个问题的关键是 Hydra 的配置合成顺序：
+
+1. `scripts/train.py` 用 `@hydra.main(config_path="../configs", config_name="train")` 指定基础配置入口是 `configs/train.yaml`。
+2. `configs/train.yaml` 里把 `model` 默认设成 `null`（`defaults` 中是 `- model: null`），所以仅靠基础配置时 `cfg.model` 还没有具体模型结构。
+3. 真正训练时通过命令行传 `task=...`（例如 `task=libero_uncond_2cam224_1e-4`），Hydra 会加载 `configs/task/*.yaml`。
+4. task 配置里用 `override /model: fastwam`（或 `fastwam_joint` / `fastwam_idm`）把模型组覆盖掉。
+5. 对应模型组文件在 `configs/model/*.yaml`，其中包含 `_target_`（比如 `fastwam.runtime.create_fastwam`）以及完整的模型参数；最终这整棵配置树就是 `cfg.model`。
+
+所以：
+
+- 当你跑 `task=libero_uncond_2cam224_1e-4` 时，`cfg.model` 来自 `configs/model/fastwam.yaml`。
+- 当你跑 `task=libero_joint_2cam224_1e-4` 时，`cfg.model` 来自 `configs/model/fastwam_joint.yaml`。
+- 当你跑 `task=libero_idm_2cam224_1e-4` 时，`cfg.model` 来自 `configs/model/fastwam_idm.yaml`。
+
+最后在 `run_training` 中，代码用 `instantiate(cfg.model, model_dtype=model_dtype, device=model_device)` 实例化该模型配置。
+
 
 ## 2. Precision（混合精度）配置如何生效
 
@@ -156,6 +174,35 @@ with self.accelerator.autocast():
 后续 `RobotVideoDataset` 读取该缓存，供训练直接使用。
 
 ---
+
+## 3.6 按“网络部件”拆开的 dtype 清单（你最关心的版本）
+
+> 结论先行：大多数可训练模块参数 dtype = `cfg.mixed_precision` 映射得到的 `model_dtype`（默认 bf16）；
+> 但有一部分中间计算会固定用 fp32/fp64 再转换回来，这是有意的数值稳定策略。
+
+| 部件 | 参数/主计算 dtype | 关键补充 |
+|---|---|---|
+| Video expert (`WanVideoDiT`) | `model_dtype`（no→fp32, fp16→fp16, bf16→bf16） | 由 `load_wan22_ti2v_5b_components(..., torch_dtype=...)` 加载后 `.to(dtype=torch_dtype)` |
+| Action expert (`ActionDiT`) | `model_dtype` | `ActionDiT.from_pretrained(...).to(dtype=torch_dtype)` |
+| MoT（混合注意力容器） | 跟随输入 token dtype（通常 `model_dtype`） | modulation 会 `to(dtype=t_mod.dtype)` 对齐时间调制张量 |
+| VAE (`WanVideoVAE38`) | `model_dtype` | 同样通过 loader `.to(dtype=torch_dtype)` |
+| Text encoder (`WanTextEncoder`) | `model_dtype`（若加载） | 若 `load_text_encoder=false`，训练依赖离线 `context/context_mask` |
+| Tokenizer | 非浮点参数（输出 id/mask） | `ids` 为整型 token id，`mask` 在模型前向前转 `bool` |
+| Proprio encoder (`nn.Linear`) | `model_dtype`（若启用） | 初始化时显式 `.to(torch_dtype)` |
+| Scheduler（Flow-Matching） | 内部采样/权重计算含 fp32/fp64，再 cast 回目标 dtype | 例如 `torch.rand(..., dtype=float32)`、预计算网格 `float64` |
+| Loss 计算 | 强制 `pred.float()/target.float()`（fp32） | 再做 reduce/加权，提升稳定性 |
+| Mask 张量 | `torch.bool` | `context_mask/action_is_pad/image_is_pad` 全部按 bool 处理 |
+
+### 3.7 训练时一个 batch 的 dtype 轨迹（FastWAM）
+
+1. DataLoader 出来的 `video/action/proprio/context` 初始多为 `float32`（来自数据预处理与缓存）。
+2. `build_inputs` 中统一 cast：
+   - `video/action/context/proprio -> self.torch_dtype`
+   - `*_mask -> bool`
+3. DiT/MoT/VAE 主干在 `self.torch_dtype` + `accelerator.autocast()` 下计算。
+4. loss 前把预测与目标升到 fp32（`.float()`）算 MSE。
+5. 反向传播仍由 Accelerate AMP/DeepSpeed 管理缩放与同步。
+
 
 ## 4. Dataset 处理与载入全链路
 
