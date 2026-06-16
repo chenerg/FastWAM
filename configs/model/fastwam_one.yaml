@@ -5,6 +5,7 @@ tokenizer_max_len: 128
 load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
 redirect_common_files: true
+video_action_dit_pretrained_path: checkpoints/WanVideoActionDiT_partial_init_Wan22.pt
 skip_dit_load_from_pretrain: false
 action_per_frame: null
 

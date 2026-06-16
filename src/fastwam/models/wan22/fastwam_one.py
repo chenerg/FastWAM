@@ -112,6 +112,7 @@ class FastWAMOne(nn.Module):
         proprio_dim: Optional[int] = None,
         redirect_common_files: bool = True,
         video_action_dit_config: dict[str, Any] | None = None,
+        video_action_dit_pretrained_path: str | None = None,
         skip_dit_load_from_pretrain: bool = False,
         video_train_shift: float = 5.0,
         video_infer_shift: float = 5.0,
@@ -141,17 +142,29 @@ class FastWAMOne(nn.Module):
             tokenizer_max_len=tokenizer_max_len,
             redirect_common_files=redirect_common_files,
             dit_config=base_video_cfg,
-            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain,
+            skip_dit_load_from_pretrain=skip_dit_load_from_pretrain or bool(video_action_dit_pretrained_path),
             load_text_encoder=load_text_encoder,
         )
 
-        dit = WanVideoActionDiT(**_filter_kwargs_for(WanVideoActionDiT, dit_cfg)).to(device=device, dtype=torch_dtype)
-        missing, unexpected = dit.load_state_dict(components.dit.state_dict(), strict=False)
-        logger.info(
-            "Initialized FastWAMOne DiT from WanVideoDiT weights: missing=%d unexpected=%d",
-            len(missing),
-            len(unexpected),
-        )
+        if video_action_dit_pretrained_path:
+            dit = WanVideoActionDiT.from_pretrained_payload(
+                video_action_dit_config=_filter_kwargs_for(WanVideoActionDiT, dit_cfg),
+                video_action_dit_pretrained_path=video_action_dit_pretrained_path,
+                device=device,
+                torch_dtype=torch_dtype,
+            )
+            logger.info(
+                "Initialized FastWAMOne DiT from preprocessed WanVideoActionDiT payload: %s",
+                video_action_dit_pretrained_path,
+            )
+        else:
+            dit = WanVideoActionDiT(**_filter_kwargs_for(WanVideoActionDiT, dit_cfg)).to(device=device, dtype=torch_dtype)
+            missing, unexpected = dit.load_state_dict(components.dit.state_dict(), strict=False)
+            logger.info(
+                "Initialized FastWAMOne DiT from WanVideoDiT weights: missing=%d unexpected=%d",
+                len(missing),
+                len(unexpected),
+            )
 
         model = cls(
             dit=dit,
@@ -174,7 +187,7 @@ class FastWAMOne(nn.Module):
             action_per_frame=action_per_frame,
         )
         model.model_paths = {
-            "video_action_dit_init": components.dit_path,
+            "video_action_dit_init": video_action_dit_pretrained_path or components.dit_path,
             "vae": components.vae_path,
             "text_encoder": components.text_encoder_path,
             "tokenizer": components.tokenizer_path,

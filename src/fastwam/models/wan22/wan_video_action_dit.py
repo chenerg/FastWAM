@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import os
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -95,6 +97,20 @@ def get_mesh_id(
 class WanVideoActionDiT(nn.Module):
     """Single-block-stack DiT for joint video, depth-as-video, and action generation."""
 
+    VIDEO_BACKBONE_META_KEYS = (
+        "hidden_dim",
+        "ffn_dim",
+        "num_layers",
+        "num_heads",
+        "attn_head_dim",
+        "text_dim",
+        "freq_dim",
+        "eps",
+        "in_dim",
+        "out_dim",
+        "patch_size",
+    )
+
     def __init__(
         self,
         hidden_dim: int,
@@ -178,6 +194,105 @@ class WanVideoActionDiT(nn.Module):
             max_seq_len=rope_max_seq_len,
             theta=rope_theta,
         )
+
+    @classmethod
+    def from_pretrained_payload(
+        cls,
+        video_action_dit_config: dict[str, Any],
+        video_action_dit_pretrained_path: str | None = None,
+        device: str = "cuda",
+        torch_dtype: torch.dtype = torch.bfloat16,
+    ) -> "WanVideoActionDiT":
+        if video_action_dit_config is None:
+            raise ValueError("`video_action_dit_config` is required.")
+        model = cls(**video_action_dit_config).to(device=device, dtype=torch_dtype)
+        if not video_action_dit_pretrained_path:
+            return model
+
+        p = Path(video_action_dit_pretrained_path)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parents[4] / p
+        video_action_dit_pretrained_path = str(p)
+        if not os.path.isfile(video_action_dit_pretrained_path):
+            raise FileNotFoundError(
+                f"`video_action_dit_pretrained_path` does not exist: {video_action_dit_pretrained_path}"
+            )
+
+        payload = torch.load(video_action_dit_pretrained_path, map_location="cpu")
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Invalid WanVideoActionDiT payload type from {video_action_dit_pretrained_path}: {type(payload)}"
+            )
+
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            raise ValueError(f"`meta` must be a dict in {video_action_dit_pretrained_path}")
+        expected_meta = {
+            "hidden_dim": int(video_action_dit_config["hidden_dim"]),
+            "ffn_dim": int(video_action_dit_config["ffn_dim"]),
+            "num_layers": int(video_action_dit_config["num_layers"]),
+            "num_heads": int(video_action_dit_config["num_heads"]),
+            "attn_head_dim": int(video_action_dit_config["attn_head_dim"]),
+            "text_dim": int(video_action_dit_config["text_dim"]),
+            "freq_dim": int(video_action_dit_config["freq_dim"]),
+            "eps": float(video_action_dit_config["eps"]),
+            "in_dim": int(video_action_dit_config["in_dim"]),
+            "out_dim": int(video_action_dit_config["out_dim"]),
+            "patch_size": tuple(int(v) for v in video_action_dit_config["patch_size"]),
+        }
+        for key in cls.VIDEO_BACKBONE_META_KEYS:
+            if key not in meta:
+                raise ValueError(f"`meta.{key}` missing in {video_action_dit_pretrained_path}")
+            expected_value = expected_meta[key]
+            got_value = meta[key]
+            if key == "eps":
+                if abs(float(got_value) - float(expected_value)) > 1e-12:
+                    raise ValueError(
+                        f"`meta.{key}` mismatch in {video_action_dit_pretrained_path}: "
+                        f"expected {expected_value}, got {got_value}"
+                    )
+            elif key == "patch_size":
+                if tuple(int(v) for v in got_value) != tuple(expected_value):
+                    raise ValueError(
+                        f"`meta.{key}` mismatch in {video_action_dit_pretrained_path}: "
+                        f"expected {expected_value}, got {got_value}"
+                    )
+            elif int(got_value) != int(expected_value):
+                raise ValueError(
+                    f"`meta.{key}` mismatch in {video_action_dit_pretrained_path}: "
+                    f"expected {expected_value}, got {got_value}"
+                )
+
+        initialized_state_dict = payload.get("initialized_state_dict")
+        if not isinstance(initialized_state_dict, dict):
+            raise ValueError(
+                f"`initialized_state_dict` must be a dict in {video_action_dit_pretrained_path}, "
+                f"got {type(initialized_state_dict)}"
+            )
+
+        current_state = model.state_dict()
+        unexpected_keys = sorted(set(initialized_state_dict) - set(current_state))
+        if unexpected_keys:
+            raise ValueError(
+                "WanVideoActionDiT init payload has unexpected keys: "
+                f"{unexpected_keys[:10]}{'...' if len(unexpected_keys) > 10 else ''}"
+            )
+        merged_state = dict(current_state)
+        for key, value in initialized_state_dict.items():
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(
+                    f"`initialized_state_dict[{key}]` must be torch.Tensor in "
+                    f"{video_action_dit_pretrained_path}, got {type(value)}"
+                )
+            target = merged_state[key]
+            if tuple(value.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Shape mismatch for `{key}` in {video_action_dit_pretrained_path}: "
+                    f"expected {tuple(target.shape)}, got {tuple(value.shape)}"
+                )
+            merged_state[key] = value.to(device=target.device, dtype=target.dtype)
+        model.load_state_dict(merged_state, strict=True)
+        return model
 
     def patchify(self, x: torch.Tensor, *, modality: str) -> torch.Tensor:
         if modality == "video":
@@ -414,4 +529,3 @@ class WanVideoActionDiT(nn.Module):
             out[name] = self.post_dit(mixed_tokens[:, start : start + seq_len], pre_states[name])
             start += seq_len
         return out
-
