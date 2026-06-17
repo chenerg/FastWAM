@@ -62,6 +62,20 @@ class WanGridRotaryPosEmbed(nn.Module):
             return torch.polar(torch.ones_like(freqs), freqs)
 
 
+class ActionHead(nn.Module):
+    def __init__(self, hidden_dim: int, out_dim: int, eps: float):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim, eps=eps, elementwise_affine=False)
+        self.proj = nn.Linear(hidden_dim, out_dim)
+        self.modulation = nn.Parameter(torch.randn(1, 2, hidden_dim) / hidden_dim**0.5)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        shift, scale = (self.modulation.to(dtype=t.dtype, device=t.device) + t.unsqueeze(1)).chunk(2, dim=1)
+        shift = shift.squeeze(1)
+        scale = scale.squeeze(1)
+        return self.proj(self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1))
+
+
 def get_mesh_id(
     f: int,
     h: int,
@@ -188,7 +202,7 @@ class WanVideoActionDiT(nn.Module):
         )
         self.head = Head(self.hidden_dim, self.out_dim, self.patch_size, eps)
         self.depth_head = deepcopy(self.head)
-        self.action_head = nn.Linear(self.hidden_dim, self.action_dim)
+        self.action_head = ActionHead(self.hidden_dim, self.action_dim, eps)
         self.rope = WanGridRotaryPosEmbed(
             attention_head_dim=self.attn_head_dim,
             max_seq_len=rope_max_seq_len,
@@ -481,7 +495,7 @@ class WanVideoActionDiT(nn.Module):
     def post_dit(self, tokens: torch.Tensor, pre_state: Dict[str, Any]) -> torch.Tensor:
         modality = pre_state["meta"]["modality"]
         if modality == "action":
-            return self.action_head(tokens)
+            return self.action_head(tokens, pre_state["t"])
         if modality == "video":
             x = self.head(tokens, pre_state["t"])
             return self.unpatchify(x, pre_state["meta"]["grid_size"])
