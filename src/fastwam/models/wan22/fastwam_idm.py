@@ -15,6 +15,73 @@ class FastWAMIDM(FastWAMJoint):
 
     # Hardcoded probability: during training, cond-video is noised with this chance.
     video_cond_noise_prob = 0.5
+    VALID_ACTION_REFERENCE_MODES = {"full", "first_frame", "random"}
+
+    @classmethod
+    def from_wan22_pretrained(
+        cls,
+        idm_action_reference_mode: str = "full",
+        idm_first_frame_reference_prob: float = 0.0,
+        idm_infer_action_reference_mode: str = "full",
+        **kwargs,
+    ):
+        model = super().from_wan22_pretrained(**kwargs)
+        model.idm_action_reference_mode = cls._normalize_action_reference_mode(
+            idm_action_reference_mode,
+            allow_random=True,
+        )
+        model.idm_first_frame_reference_prob = float(idm_first_frame_reference_prob)
+        if not 0.0 <= model.idm_first_frame_reference_prob <= 1.0:
+            raise ValueError(
+                "`idm_first_frame_reference_prob` must be in [0, 1], "
+                f"got {model.idm_first_frame_reference_prob}."
+            )
+        model.idm_infer_action_reference_mode = cls._normalize_action_reference_mode(
+            idm_infer_action_reference_mode,
+            allow_random=False,
+        )
+        logger.info(
+            "FastWAMIDM action reference: train=%s first_frame_prob=%.3f infer=%s",
+            model.idm_action_reference_mode,
+            model.idm_first_frame_reference_prob,
+            model.idm_infer_action_reference_mode,
+        )
+        return model
+
+    @staticmethod
+    def _normalize_action_reference_mode(mode: str, *, allow_random: bool) -> str:
+        mode = str(mode).strip().lower()
+        aliases = {
+            "idm": "full",
+            "original": "full",
+            "video": "full",
+            "video_full": "full",
+            "first": "first_frame",
+            "first_frame_only": "first_frame",
+            "uncond": "first_frame",
+        }
+        mode = aliases.get(mode, mode)
+        valid = set(FastWAMIDM.VALID_ACTION_REFERENCE_MODES)
+        if not allow_random:
+            valid.discard("random")
+        if mode not in valid:
+            raise ValueError(
+                f"Unsupported IDM action reference mode: {mode!r}. "
+                f"Expected one of {sorted(valid)}."
+            )
+        return mode
+
+    def _sample_training_action_reference_mode(self) -> str:
+        mode = self._normalize_action_reference_mode(
+            getattr(self, "idm_action_reference_mode", "full"),
+            allow_random=True,
+        )
+        if mode != "random":
+            return mode
+        prob = float(getattr(self, "idm_first_frame_reference_prob", 0.0))
+        if bool(torch.rand((), device=self.device) < prob):
+            return "first_frame"
+        return "full"
 
     @torch.no_grad()
     def _build_teacher_forcing_attention_mask(
@@ -25,7 +92,12 @@ class FastWAMIDM(FastWAMJoint):
         noisy_video_tokens_per_frame: int,
         cond_video_tokens_per_frame: int,
         device: torch.device,
+        action_reference_mode: str = "full",
     ) -> torch.Tensor:
+        action_reference_mode = self._normalize_action_reference_mode(
+            action_reference_mode,
+            allow_random=False,
+        )
         if noisy_video_tokens_per_frame != cond_video_tokens_per_frame:
             raise ValueError(
                 "Teacher-forcing requires identical `tokens_per_frame` for noisy and cond video branches, "
@@ -51,8 +123,45 @@ class FastWAMIDM(FastWAMJoint):
         )
         # action -> action
         mask[cond_end:, cond_end:] = True
-        # action -> cond_video only
-        mask[cond_end:, noisy_end:cond_end] = True
+        if action_reference_mode == "full":
+            # action -> full cond_video only
+            mask[cond_end:, noisy_end:cond_end] = True
+        elif action_reference_mode == "first_frame":
+            # action -> cond_video first frame only
+            cond_first_frame_end = noisy_end + min(cond_video_tokens_per_frame, cond_video_seq_len)
+            mask[cond_end:, noisy_end:cond_first_frame_end] = True
+        return mask
+
+    @torch.no_grad()
+    def _build_mot_attention_mask(
+        self,
+        video_seq_len: int,
+        action_seq_len: int,
+        video_tokens_per_frame: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        infer_mode = self._normalize_action_reference_mode(
+            getattr(self, "idm_infer_action_reference_mode", "full"),
+            allow_random=False,
+        )
+        if infer_mode == "full":
+            return super()._build_mot_attention_mask(
+                video_seq_len=video_seq_len,
+                action_seq_len=action_seq_len,
+                video_tokens_per_frame=video_tokens_per_frame,
+                device=device,
+            )
+
+        total_seq_len = video_seq_len + action_seq_len
+        mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
+        mask[:video_seq_len, :video_seq_len] = self.video_expert.build_video_to_video_mask(
+            video_seq_len=video_seq_len,
+            video_tokens_per_frame=video_tokens_per_frame,
+            device=device,
+        )
+        mask[video_seq_len:, video_seq_len:] = True
+        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
+        mask[video_seq_len:, :first_frame_tokens] = True
         return mask
 
     def training_loss(self, sample, tiled: bool = False):
@@ -143,6 +252,7 @@ class FastWAMIDM(FastWAMJoint):
         cond_video_seq_len = int(video_pre_cond["tokens"].shape[1])
         noisy_video_tokens_per_frame = int(video_pre_noisy["meta"]["tokens_per_frame"])
         cond_video_tokens_per_frame = int(video_pre_cond["meta"]["tokens_per_frame"])
+        action_reference_mode = self._sample_training_action_reference_mode()
 
         # Concatenate [noisy_video, cond_video] as the video expert sequence.
         merged_video_tokens = torch.cat([video_pre_noisy["tokens"], video_pre_cond["tokens"]], dim=1)
@@ -157,6 +267,7 @@ class FastWAMIDM(FastWAMJoint):
             noisy_video_tokens_per_frame=noisy_video_tokens_per_frame,
             cond_video_tokens_per_frame=cond_video_tokens_per_frame,
             device=merged_video_tokens.device,
+            action_reference_mode=action_reference_mode,
         )
 
         tokens_out = self.mot(
@@ -223,6 +334,7 @@ class FastWAMIDM(FastWAMJoint):
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "idm_action_reference_first_frame": float(action_reference_mode == "first_frame"),
         }
         return loss_total, loss_dict
 

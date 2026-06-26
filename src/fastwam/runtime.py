@@ -257,6 +257,9 @@ def create_fastwam_idm(
     action_scheduler=None,
     loss=None,
     mot_checkpoint_mixed_attn: bool = True,
+    idm_action_reference_mode: str = "full",
+    idm_first_frame_reference_prob: float = 0.0,
+    idm_infer_action_reference_mode: str = "full",
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
@@ -327,6 +330,9 @@ def create_fastwam_idm(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        idm_action_reference_mode=str(idm_action_reference_mode),
+        idm_first_frame_reference_prob=float(idm_first_frame_reference_prob),
+        idm_infer_action_reference_mode=str(idm_infer_action_reference_mode),
     )
 
 
